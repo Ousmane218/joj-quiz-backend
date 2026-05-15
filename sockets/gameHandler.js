@@ -1,0 +1,288 @@
+const { Game, GamePlayer, Match, MatchAnswer, GameResult, Question, QuizQuestion } = require('../models');
+const { Op } = require('sequelize');
+
+// In-memory game state — stored here during a live match, saved to DB when match ends
+const rooms = {};
+
+const QUESTION_TIME_MS = 20000; // 20 seconds per question
+
+module.exports = (io) => {
+  io.on('connection', (socket) => {
+    console.log('Socket connected:', socket.id);
+
+    // ── JOIN ROOM ────────────────────────────────────────────────────────────
+    socket.on('join-room', async ({ roomCode, userId, username }) => {
+      try {
+        // Verify room exists in DB
+        const game = await Game.findOne({ where: { room_code: roomCode, status: { [Op.ne]: 'finished' } } });
+        if (!game) {
+          socket.emit('error', { message: 'Room not found' });
+          return;
+        }
+
+        // Add player to game_players if not already there
+        await GamePlayer.findOrCreate({ where: { game_id: game.id, user_id: userId } });
+
+        // Initialize room state if first person
+        if (!rooms[roomCode]) {
+          rooms[roomCode] = {
+            gameId: game.id,
+            hostId: game.host_id,
+            maxMatches: game.max_matches,
+            players: {},
+            matchNumber: 0,
+            matchScores: {},
+          };
+        }
+
+        // Add player to in-memory room
+        rooms[roomCode].players[socket.id] = { userId, username, score: 0 };
+        rooms[roomCode].matchScores[userId] = rooms[roomCode].matchScores[userId] || 0;
+        socket.join(roomCode);
+        socket.data.roomCode = roomCode;
+        socket.data.userId = userId;
+
+        // Tell everyone in room a new player joined
+        const playerList = Object.values(rooms[roomCode].players)
+          .map(p => ({ userId: p.userId, username: p.username, score: p.score }));
+
+        io.to(roomCode).emit('room-update', { players: playerList });
+        console.log(`${username} joined room ${roomCode}`);
+      } catch (err) {
+        console.error('join-room error:', err);
+        socket.emit('error', { message: 'Could not join room' });
+      }
+    });
+
+    // ── START MATCH ──────────────────────────────────────────────────────────
+    socket.on('start-match', async ({ roomCode, quizId }) => {
+      try {
+        const room = rooms[roomCode];
+        if (!room) return;
+        if (room.hostId !== socket.data.userId) {
+          socket.emit('error', { message: 'Only the host can start the match' });
+          return;
+        }
+
+        // Load questions for this quiz
+        const questionsDB = await Question.findAll({
+          include: [{ model: QuizQuestion, where: { quiz_id: quizId }, attributes: ['order_index'] }],
+          order: [[QuizQuestion, 'order_index', 'ASC']],
+        });
+
+        if (questionsDB.length === 0) {
+          socket.emit('error', { message: 'Quiz has no questions' });
+          return;
+        }
+
+        // Parse options + strip correct_index before sending to players
+        room.questions = questionsDB.map(q => {
+          const plain = q.toJSON();
+          return {
+            ...plain,
+            options: typeof plain.options === 'string' ? JSON.parse(plain.options) : plain.options,
+          };
+        });
+        room.currentQ = 0;
+        room.answers = {};
+        room.quizId = quizId;
+        room.matchNumber += 1;
+
+        // Reset per-match scores
+        Object.keys(room.players).forEach(sid => {
+          room.players[sid].score = 0;
+        });
+
+        // Create match record in DB
+        const match = await Match.create({ game_id: room.gameId, quiz_id: quizId, match_number: room.matchNumber, status: 'in_progress' });
+        room.matchId = match.id;
+
+        // Update game status
+        await Game.update({ status: 'in_progress' }, { where: { id: room.gameId } });
+
+        io.to(roomCode).emit('match-started', {
+          matchNumber: room.matchNumber,
+          totalQuestions: room.questions.length,
+        });
+
+        // Send first question after a short delay
+        setTimeout(() => sendQuestion(io, roomCode), 1500);
+      } catch (err) {
+        console.error('start-match error:', err);
+      }
+    });
+
+    // ── SUBMIT ANSWER ────────────────────────────────────────────────────────
+    socket.on('submit-answer', ({ roomCode, chosenIndex, responseMs }) => {
+      const room = rooms[roomCode];
+      if (!room) return;
+      const userId = socket.data.userId;
+
+      // Ignore duplicate answers
+      if (room.answers[userId] !== undefined) return;
+
+      const question = room.questions[room.currentQ];
+      const isCorrect = chosenIndex === question.correct_index;
+      const score = isCorrect
+        ? Math.round(1000 * Math.max(0, 1 - responseMs / QUESTION_TIME_MS))
+        : 0;
+
+      room.answers[userId] = { chosenIndex, responseMs, score, isCorrect };
+      room.players[socket.id].score += score;
+
+      // Confirm to the player who answered
+      socket.emit('answer-confirmed', { score, isCorrect });
+
+      // If everyone has answered, end round early
+      const totalPlayers = Object.keys(room.players).length;
+      const totalAnswers = Object.keys(room.answers).length;
+      if (totalAnswers >= totalPlayers) {
+        clearTimeout(room.timer);
+        endRound(io, roomCode);
+      }
+    });
+
+    // ── DISCONNECT ───────────────────────────────────────────────────────────
+    socket.on('disconnect', () => {
+      const roomCode = socket.data.roomCode;
+      if (roomCode && rooms[roomCode]) {
+        delete rooms[roomCode].players[socket.id];
+        const playerList = Object.values(rooms[roomCode].players)
+          .map(p => ({ userId: p.userId, username: p.username, score: p.score }));
+        io.to(roomCode).emit('room-update', { players: playerList });
+      }
+      console.log('Socket disconnected:', socket.id);
+    });
+  });
+};
+
+// ── HELPERS ────────────────────────────────────────────────────────────────────
+
+function sendQuestion(io, roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  const question = room.questions[room.currentQ];
+  room.answers = {}; // reset answers for this round
+  room.questionStartTime = Date.now();
+
+  // Send question WITHOUT correct_index
+  io.to(roomCode).emit('question', {
+    questionIndex: room.currentQ,
+    total: room.questions.length,
+    id: question.id,
+    text: question.text,
+    options: question.options,
+    type: question.type,
+    timeLimit: QUESTION_TIME_MS / 1000,
+  });
+
+  // Server-side timer — auto-end round when time is up
+  room.timer = setTimeout(() => endRound(io, roomCode), QUESTION_TIME_MS);
+}
+
+async function endRound(io, roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  const question = room.questions[room.currentQ];
+
+  // Build scores snapshot
+  const scores = Object.values(room.players).map(p => ({
+    userId: p.userId,
+    username: p.username,
+    roundScore: room.answers[p.userId]?.score || 0,
+    totalScore: p.score,
+  })).sort((a, b) => b.totalScore - a.totalScore);
+
+  // Save each player's answer to DB
+  try {
+    for (const [userId, ans] of Object.entries(room.answers)) {
+      await MatchAnswer.create({ match_id: room.matchId, player_id: userId, question_id: question.id, chosen_index: ans.chosenIndex, response_ms: ans.responseMs, score: ans.score });
+    }
+  } catch (err) {
+    console.error('Error saving answers:', err);
+  }
+
+  io.to(roomCode).emit('round-result', {
+    correctIndex: question.correct_index,
+    scores,
+    questionIndex: room.currentQ,
+  });
+
+  room.currentQ += 1;
+
+  // More questions? Send next after 4 seconds. Otherwise end the match.
+  if (room.currentQ < room.questions.length) {
+    setTimeout(() => sendQuestion(io, roomCode), 4000);
+  } else {
+    setTimeout(() => endMatch(io, roomCode), 4000);
+  }
+}
+
+async function endMatch(io, roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  // Find match winner (highest score)
+  const sorted = Object.values(room.players)
+    .sort((a, b) => b.score - a.score);
+  const winner = sorted[0];
+
+  // Update match in DB
+  await Match.update({ status: 'finished', winner_id: winner.userId }, { where: { id: room.matchId } });
+
+  // Track match wins
+  room.matchScores[winner.userId] = (room.matchScores[winner.userId] || 0) + 1;
+
+  const matchScoreSnapshot = Object.entries(room.matchScores).map(([uid, wins]) => {
+    const player = Object.values(room.players).find(p => p.userId == uid);
+    return { userId: uid, username: player?.username, matchWins: wins };
+  });
+
+  io.to(roomCode).emit('match-end', {
+    matchNumber: room.matchNumber,
+    winner: { userId: winner.userId, username: winner.username },
+    matchScores: matchScoreSnapshot,
+    isGameOver: room.matchNumber >= room.maxMatches,
+  });
+
+  // If all matches played, end the game
+  if (room.matchNumber >= room.maxMatches) {
+    setTimeout(() => endGame(io, roomCode), 3000);
+  }
+}
+
+async function endGame(io, roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  // Game winner = most match wins
+  const sorted = Object.entries(room.matchScores)
+    .sort(([, a], [, b]) => b - a);
+  const gameWinnerId = sorted[0][0];
+  const gameWinner = Object.values(room.players)
+    .find(p => p.userId == gameWinnerId);
+
+  // Final scores object: { userId: totalMatchScore }
+  const finalScores = {};
+  Object.values(room.players).forEach(p => {
+    finalScores[p.userId] = p.score;
+  });
+
+  try {
+    await GameResult.create({ game_id: room.gameId, winner_id: gameWinnerId, final_scores: finalScores });
+    await Game.update({ status: 'finished' }, { where: { id: room.gameId } });
+  } catch (err) {
+    console.error('Error saving game result:', err);
+  }
+
+  io.to(roomCode).emit('game-end', {
+    winner: { userId: gameWinnerId, username: gameWinner?.username },
+    finalScores,
+    matchScores: room.matchScores,
+  });
+
+  // Clean up memory
+  delete rooms[roomCode];
+}
