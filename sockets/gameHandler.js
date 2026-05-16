@@ -1,4 +1,4 @@
-const { Game, GamePlayer, Match, MatchAnswer, GameResult, Question, QuizQuestion } = require('../models');
+const { Game, GamePlayer, Match, MatchAnswer, GameResult, Question, Quiz, QuizQuestion } = require('../models');
 const { Op } = require('sequelize');
 
 // In-memory game state — stored here during a live match, saved to DB when match ends
@@ -21,7 +21,10 @@ module.exports = (io) => {
         }
 
         // Add player to game_players if not already there
-        await GamePlayer.findOrCreate({ where: { game_id: game.id, user_id: userId } });
+        const existingPlayer = await GamePlayer.findOne({ where: { game_id: game.id, user_id: userId } });
+        if (!existingPlayer) {
+          await GamePlayer.create({ game_id: game.id, user_id: userId });
+        }
 
         // Initialize room state if first person
         if (!rooms[roomCode]) {
@@ -59,27 +62,30 @@ module.exports = (io) => {
       try {
         const room = rooms[roomCode];
         if (!room) return;
-        if (room.hostId !== socket.data.userId) {
+        if (room.hostId != socket.data.userId) {
           socket.emit('error', { message: 'Only the host can start the match' });
           return;
         }
 
-        // Load questions for this quiz
-        const questionsDB = await Question.findAll({
-          include: [{ model: QuizQuestion, where: { quiz_id: quizId }, attributes: ['order_index'] }],
-          order: [[QuizQuestion, 'order_index', 'ASC']],
+        // Load questions for this quiz using the junction model directly to be safe
+        const quizQuestions = await QuizQuestion.findAll({
+          where: { quiz_id: quizId },
+          include: [{ model: Question }],
+          order: [['order_index', 'ASC']]
         });
 
-        if (questionsDB.length === 0) {
+        if (!quizQuestions || quizQuestions.length === 0) {
           socket.emit('error', { message: 'Quiz has no questions' });
           return;
         }
 
         // Parse options + strip correct_index before sending to players
-        room.questions = questionsDB.map(q => {
+        room.questions = quizQuestions.map(qq => {
+          const q = qq.Question;
           const plain = q.toJSON();
           return {
             ...plain,
+            order_index: qq.order_index,
             options: typeof plain.options === 'string' ? JSON.parse(plain.options) : plain.options,
           };
         });
@@ -109,6 +115,7 @@ module.exports = (io) => {
         setTimeout(() => sendQuestion(io, roomCode), 1500);
       } catch (err) {
         console.error('start-match error:', err);
+        socket.emit('error', { message: 'Failed to start match' });
       }
     });
 
@@ -163,6 +170,11 @@ function sendQuestion(io, roomCode) {
   if (!room) return;
 
   const question = room.questions[room.currentQ];
+  if (!question) {
+    console.error(`Question at index ${room.currentQ} is undefined for room ${roomCode}`);
+    return;
+  }
+
   room.answers = {}; // reset answers for this round
   room.questionStartTime = Date.now();
 
@@ -185,7 +197,12 @@ async function endRound(io, roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
 
+  // Prevent endRound from running multiple times for the same question
+  if (room.endingRound === room.currentQ) return;
+  room.endingRound = room.currentQ;
+
   const question = room.questions[room.currentQ];
+  if (!question) return;
 
   // Build scores snapshot
   const scores = Object.values(room.players).map(p => ({

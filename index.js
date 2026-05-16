@@ -17,6 +17,9 @@ app.use('/api/auth', require('./routes/auth'));
 // Day 2 routes added here later:
 app.use('/api/quizzes', require('./routes/quizzes'));
 app.use('/api/games', require('./routes/games'));
+app.use('/api/leaderboard', require('./routes/leaderboard'));
+app.use('/api/profile', require('./routes/profile'));
+app.use('/api/fun-fact', require('./routes/funfact'));
 
 const { sequelize } = require('./models');
 

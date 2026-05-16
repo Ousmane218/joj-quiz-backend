@@ -27,11 +27,23 @@ const GameResult   = require('./GameResult')(sequelize);
 User.hasMany(Quiz, { foreignKey: 'created_by' });
 Quiz.belongsTo(User, { foreignKey: 'created_by', as: 'creator' });
 
-Quiz.belongsToMany(Question, { through: QuizQuestion, foreignKey: 'quiz_id' });
-Question.belongsToMany(Quiz, { through: QuizQuestion, foreignKey: 'question_id' });
+Quiz.belongsToMany(Question, { through: QuizQuestion, foreignKey: 'quiz_id', otherKey: 'question_id' });
+Question.belongsToMany(Quiz, { through: QuizQuestion, foreignKey: 'question_id', otherKey: 'quiz_id' });
+
+// Explicit junction associations for easier eager loading
+Quiz.hasMany(QuizQuestion, { foreignKey: 'quiz_id' });
+QuizQuestion.belongsTo(Quiz, { foreignKey: 'quiz_id' });
+Question.hasMany(QuizQuestion, { foreignKey: 'question_id' });
+QuizQuestion.belongsTo(Question, { foreignKey: 'question_id' });
 
 Game.belongsTo(User, { foreignKey: 'host_id', as: 'host' });
-Game.belongsToMany(User, { through: GamePlayer, foreignKey: 'game_id', as: 'players' });
+Game.belongsToMany(User, { through: GamePlayer, foreignKey: 'game_id', otherKey: 'user_id', as: 'players' });
+
+// Explicit junction associations
+Game.hasMany(GamePlayer, { foreignKey: 'game_id' });
+GamePlayer.belongsTo(Game, { foreignKey: 'game_id' });
+User.hasMany(GamePlayer, { foreignKey: 'user_id' });
+GamePlayer.belongsTo(User, { foreignKey: 'user_id' });
 
 Match.belongsTo(Game, { foreignKey: 'game_id' });
 Match.belongsTo(Quiz, { foreignKey: 'quiz_id' });
