@@ -12,6 +12,7 @@ const allowedOrigins = [
   'https://finalwebdevos-production.up.railway.app',
   'https://joj-quiz-frontend.vercel.app',
   /\.onrender\.com$/, // Allow any Render subdomain
+  'https://joj-quiz-backend.onrender.com'
 ];
 
 const io = new Server(server, {
